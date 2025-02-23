@@ -1,86 +1,104 @@
 import os
 import ee
 import requests
-from datetime import datetime, timedelta
+from PIL import Image
+from io import BytesIO
+import logging
 
-# Ensure authentication works correctly (Set the correct path)
-os.environ["EARTHENGINE_CREDENTIALS"] = "/Users/ibm/.config/earthengine/credentials"
+# Set up logging for better error tracking
+logging.basicConfig(level=logging.DEBUG)
 
-# Initialize Earth Engine API
+# Set your OpenCage API key
+api_key = 'f4909b358d6c496b8e6387ab83474d39'
+
+if not api_key:
+    logging.error("OpenCage API key is missing. Please set it.")
+    exit(1)
+
+# Define the address you want to geocode
+address = '15620 Kinross Cir, Fort Myers, FL 33912'
+
+# Create the URL with your OpenCage API key and address
+url = f'https://api.opencagedata.com/geocode/v1/json?q={address}&key={api_key}'
+
+# Send the request to the API
 try:
-    ee.Initialize()
-    print("Google Earth Engine API initialized successfully!")
-except Exception as e:
-    print(f"Error initializing Earth Engine: {e}")
-    exit()
+    response = requests.get(url)
+    response.raise_for_status()  # This will raise an exception for HTTP errors
+    data = response.json()
 
-# Miami coordinates (25°46'51"N, 80°13'43"W)
-lat = 25.78083
-lon = -80.22861
-
-# Slightly larger bounding box (approximately 200 meters)
-bbox = [lon - 0.001, lat - 0.001, lon + 0.001, lat + 0.001]
-
-# Function to fetch satellite image from Google Earth Engine
-def fetch_satellite_image(date, filename):
-    print(f"\nAttempting to fetch image for date: {date}")
-    
-    # Define the area of interest (bounding box)
-    geometry = ee.Geometry.Rectangle(bbox)
-    
-    # Use Sentinel-2 imagery
-    image_collection = ee.ImageCollection("COPERNICUS/S2") \
-        .filterBounds(geometry) \
-        .filterDate(f"{date}T00:00:00", f"{date}T23:59:59") \
-        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30)) \
-        .sort('system:time_start', False)  # Sort by time to get the most recent image
-
-    # Get the first image (most recent within the date range)
-    image = image_collection.first()
-    
-    # Check if a valid image was found
-    if image.getInfo() is None:
-        print(f"No valid image found for {date}. Skipping...")
-        return False
-
-    # Visualize the image in true color (RGB)
-    vis_params = {
-        'bands': ['B4', 'B3', 'B2'],  # Red, Green, Blue bands
-        'min': 0,
-        'max': 3000,
-    }
-
-    try:
-        # Get the URL for the image
-        url = image.getThumbURL(vis_params)
-        print(f"Image URL: {url}")
-
-        # Download the image
-        response = requests.get(url)
-        
-        if response.status_code == 200:
-            with open(filename, "wb") as file:
-                file.write(response.content)
-            print(f"Successfully saved image as {filename}")
-            return True
-        else:
-            print(f"Failed to retrieve image for {date}. Status code: {response.status_code}")
-            return False
-    except Exception as e:
-        print(f"Error fetching image for {date}: {e}")
-        return False
-
-# Generate dates for the past week
-end_date = datetime.now()
-dates_to_try = [(end_date - timedelta(days=x)).strftime('%Y-%m-%d') for x in range(7)]
-
-print("Trying the following dates:", dates_to_try)
-
-for date in dates_to_try:
-    success = fetch_satellite_image(date, f"miami_house_{date}.png")
-    if success:
-        print(f"Successfully retrieved image for {date}")
-        break
+    if data['results']:
+        # Extract latitude and longitude
+        latitude = data['results'][0]['geometry']['lat']
+        longitude = data['results'][0]['geometry']['lng']
+        logging.debug(f"Latitude: {latitude}, Longitude: {longitude}")
     else:
-        print(f"Failed to retrieve image for {date}\n")
-        
+        logging.error("Address not found.")
+        latitude = None
+        longitude = None
+except requests.exceptions.RequestException as e:
+    logging.error(f"Error during geocoding request: {e}")
+    latitude = None
+    longitude = None
+
+# If the coordinates are valid, proceed with the Earth Engine code
+if latitude and longitude:
+    try:
+        # Authenticate and initialize Earth Engine
+        ee.Initialize()
+
+        # Define the coordinates for the house using the API response
+        geometry = ee.Geometry.Point([longitude, latitude]).buffer(50)  # 50m buffer around the house
+
+        # Define the date range
+        start_date = '2022-01-01'
+        end_date = '2023-12-31'
+
+        # Load the NAIP imagery
+        image_collection = ee.ImageCollection("USDA/NAIP/DOQQ") \
+            .filterBounds(geometry) \
+            .filterDate(start_date, end_date)
+
+        logging.debug(f"Number of NAIP images found: {image_collection.size().getInfo()}")
+
+        # Get the first image
+        image = image_collection.first()
+
+        if image.getInfo() is None:
+            logging.error("No valid NAIP image found for the specified date range.")
+        else:
+            # Clip the image to the geometry
+            image = image.clip(geometry)
+
+            # Set visualization parameters using native resolution only
+            vis_params = {
+                'bands': ['R', 'G', 'B'],
+                'min': 0,
+                'max': 255,
+                'scale': 0.1,  # NAIP is ~1 m per pixel
+            }
+
+            # Get the thumbnail URL without specifying 'dimensions'
+            url = image.getThumbURL(vis_params)
+            logging.debug(f"NAIP Image URL: {url}")
+
+            # Download the image
+            img_response = requests.get(url)
+            img_response.raise_for_status()  # Check for HTTP errors
+
+            # Save the image to a file
+            filename = f"naip_house_image_{start_date}_{end_date}.png"
+            with open(filename, "wb") as file:
+                file.write(img_response.content)
+            logging.info(f"Successfully saved image as {filename}")
+
+            # Open and display the image
+            img = Image.open(BytesIO(img_response.content))
+            img.show()
+
+    except ee.EEException as e:
+        logging.error(f"Error during Earth Engine processing: {e}")
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error during image download: {e}")
+else:
+    logging.error("Skipping Earth Engine processing due to invalid coordinates.")
